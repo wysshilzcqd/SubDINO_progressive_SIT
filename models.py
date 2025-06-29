@@ -6,6 +6,13 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 
+
+
+
+'''
+对transformer进行改进，改进为多头decoder，因为DINO不同层特征图通道数不同；
+progressive learning过程中，只打开对应层的decoder。共享transformer的backbone
+'''
 import torch
 import torch.nn as nn
 import numpy as np
@@ -21,7 +28,7 @@ def modulate(x, shift, scale):
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
 
-class TimestepEmbedder(nn.Module):
+class TimestepEmbedder(nn.Module): # 将时间戳嵌入到向量表示中
     """
     Embeds scalar timesteps into vector representations.
     """
@@ -61,7 +68,7 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class LabelEmbedder(nn.Module):
+class LabelEmbedder(nn.Module): # 将类标签嵌入到向量表示中
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
@@ -95,11 +102,11 @@ class LabelEmbedder(nn.Module):
 #                                 Core SiT Model                                #
 #################################################################################
 
-class SiTBlock(nn.Module):
+class SiTBlock(nn.Module): # SiT的基本模块（transformer），包括自注意力和MLP模块
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs): #hidden_size是transformer的隐藏层大小，num_heads是transformer的头数
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
@@ -119,7 +126,9 @@ class SiTBlock(nn.Module):
         return x
 
 
-class FinalLayer(nn.Module):
+#这一模块不再需要,这是用来从transformer的output最终输出为RGB图像的,而当前SIT就是为了建模特征图分布
+'''
+class FinalLayer(nn.Module): # 在输出前进行归一化、调制、线性变换
     """
     The final layer of SiT.
     """
@@ -139,7 +148,25 @@ class FinalLayer(nn.Module):
         return x
 
 
-class SiT(nn.Module):
+
+def unpatchify(self, x): #把transformer的输出调整为图片格式
+        """
+        x: (N, T, patch_size**2 * C) T是patch（每个patch对应一个token）的数量，C是通道数
+        imgs: (N, H, W, C)  N是batch_size，H是图片的高度，W是图片的宽度，C是通道数
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+'''
+
+'''
+class SiT(nn.Module): # SiT：embedding & initialization --> transformer --> unpatchify --> output
     """
     Diffusion model with a Transformer backbone.
     """
@@ -156,7 +183,7 @@ class SiT(nn.Module):
         num_classes=1000,
         learn_sigma=True,
     ):
-        super().__init__()
+        super().__init__()  # 初始化网络架构
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
@@ -176,7 +203,7 @@ class SiT(nn.Module):
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
-    def initialize_weights(self):
+    def initialize_weights(self): # 对所有参数进行初始化
         # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -212,20 +239,7 @@ class SiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
+   
 
     def forward(self, x, t, y):
         """
@@ -263,14 +277,120 @@ class SiT(nn.Module):
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
+'''
+
+#用来生成条件token
+class CondTokenPooler(nn.Module):
+    def __init__(self,hidden_dim, num_heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.query = nn.Parameter(torch.randn(1,1,hidden_dim))
+
+    def forward(self, x):
+        B,H,W,D = x.shape
+        x_flat = x.view(B,H*W,D)
+        query = self.query.expand(B,-1,-1)
+        pooled, _ = self.attn(query, x_flat, x_flat)
+        return pooled.squeeze(1)
+    
+class SiT(nn.Module):
+    def __init__(
+        self,
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=1152,
+        depth=28,
+        num_heads=16,
+        mlp_ratio=4.0,
+        class_dropout_prob=0.1,
+        num_classes=1000,
+        learn_sigma=True,
+        feature_layers=["layer11","layer9"],
+        feature_dims={"layer11":768,"layer9":384} #这两行是用来选择progressive learning时的中间层特征图和对应维数，先这样写，后续customize
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.pos_embed = nn.Parameter(torch.zeros(1, (input_size // patch_size) ** 2 + 1, hidden_size), requires_grad=False)
+
+        self.blocks = nn.ModuleList([
+            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        ])
+
+        self.feature_layers = feature_layers
+        self.feature_dims = feature_dims
+        self.decoder_heads = nn.ModuleDict({
+            layer: nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, dim)
+            )
+            for layer, dim in feature_dims.items() if layer in feature_layers
+        })
+
+        self.initialize_weights()
+
+    #初始化
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        grid_size = int(self.pos_embed.shape[1] ** 0.5)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], grid_size)
+        self.pos_embed = nn.Parameter(torch.zeros(1, (self.input_size // self.patch_size) ** 2, self.hidden_size), requires_grad=False)
 
 
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+    
+    def forward_multi_layer(self, x_t, cond_feature_map, layer_name,t, y):
+        B,H,W,D = x_t.shape
+        x = x_t.reshape(B, -1, D)
+
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y, self.training)
+        cond_token = self.cond_token_pooler(cond_feature_map)
+        cond = t_emb + y_emb + cond_token
+
+        x = torch.cat([cond.unsqueeze(1), x], 1)
+        x += self.pos_embed[:, :x.shape[1], : ]
+
+
+        for block in self.blocks:
+            x = block(x, cond)
+        
+        x = x[:, 1:, :].reshape(B,H,W,D)
+        x_hat = self.decoder_heads[layer_name](x)
+        return x_hat
+
+    def freeze_except_layer(self, layer_name):
+        for name, module in self.decoder_heads.items():
+            for param in module.parameters():
+                param.requires_grad = (name == layer_name)
+                
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0): #patch的positional encoding
     """
     grid_size: int of the grid height and width
     return:

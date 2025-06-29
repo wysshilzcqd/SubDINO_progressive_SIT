@@ -1,3 +1,5 @@
+'''
+原SIT代码
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -113,7 +115,7 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
+    # Setup DDP:  #distributed data parallel多卡分布式并行
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
@@ -154,6 +156,7 @@ def main(args):
 
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    #滑动平均，避免抖动，提高生成质量
 
     if args.ckpt is not None:
         ckpt_path = args.ckpt
@@ -337,3 +340,75 @@ if __name__ == "__main__":
     parse_transport_args(parser)
     args = parser.parse_args()
     main(args)
+'''
+
+#目前只开发主干功能：学习噪声-->特征图-->条件token-->下一层特征图
+import torch
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from Image_Dino_Dataset import ImageDinoFeatureDataset
+from transport.path import VPCPlan
+from models import SiT
+import os
+
+#==== Training Setup ====
+data_root = "imagenet保存的路径"
+save_dir = "checkpoints"
+os.makedirs(save_dir, exist_ok=True)
+plan = VPCPlan()
+
+
+total_layers = 25
+start_layer = 24
+end_layer = 24
+
+#==== Model ====
+model = SiT(
+    hidden_size = 1152,
+    depth = 28,
+    num_heads = 16,
+    mlp_ratio = 4.0,
+    class_dropout_prob = 0.1,
+    num_classes = 100, #mini-imagenet
+    feature_layers = [f"layer{i}"for i in range(total_layers)],
+    feature_dims = {f"layer{i}": 768 for i in range(total_layers)}
+)
+device = torch.device("cuda")
+model.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+#==== progressive training loop ====
+for layer_id in range(start_layer, end_layer - 1, -1):
+    layer_name = f"layer{layer_id}"
+    print(f"\n--- Training target: {layer_name} ---")
+
+    dataset = ImageDinoFeatureDataset(root_dir = data_root, target_layer = layer_id, total_layers = total_layers, image_size=224)
+    loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
+
+    model.freeze_except_layer(layer_name)
+    model.train()
+
+    for epoch in range(1):
+        for batch in loader:
+            x_target = batch["x_target"].to(device)
+            x_cond = batch["x_cond"].to(device)
+            y = batch["label"].to(device)
+
+            B = x_target.size(0)
+            t = torch.randint(1, 1000, (B,), device = device) * 0.999 + 0.001
+            noise = torch.randn_like(x_target)
+            x_t = plan.compute_xt(t, noise, x_target).detach()
+
+            x_hat = model.forward_multi_layer(x_t, x_cond, layer_name, t, y)
+
+            loss = F.mse_loss(x_hat, x_target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            print(f"x_target: {x_target.shape}, x_hat: {x_hat.shape}, loss: {loss.item():.4f}")
+
+        
+        print(f"Eppoch {epoch}, Layer {layer_name}, Loss = {loss.item(): .4f}")
+    
+    torch.save(model.state_dict(), f"{save_dir}/sit_layer{layer_id}.pt")
