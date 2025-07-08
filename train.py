@@ -342,73 +342,208 @@ if __name__ == "__main__":
     main(args)
 '''
 
-#目前只开发主干功能：学习噪声-->特征图-->条件token-->下一层特征图
-import torch
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
-from Image_Dino_Dataset import ImageDinoFeatureDataset
-from transport.path import VPCPlan
-from models import SiT
+#DDP + EMA + logger + progressive_training
+# progressive_train_ddp.py
+# 支持 DDP 多卡训练 + EMA + 日志记录 + 分层训练
+
 import os
+import torch
+import argparse
+import logging
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from collections import OrderedDict
+from time import time
+from copy import deepcopy
+from models import SiT
+from Hdf5_Dino_Dataset import HDF5DinoFeatureDataset
+from transport import create_transport
+from train_utils import parse_transport_args
+import wandb_utils
 
-#==== Training Setup ====
-data_root = "imagenet保存的路径"
-save_dir = "checkpoints"
-os.makedirs(save_dir, exist_ok=True)
-plan = VPCPlan()
+
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.9999):
+    if hasattr(model, "module"):
+        model = model.module
+    
+    with torch.no_grad():
+        ema_params = OrderedDict(ema_model.named_parameters())
+        model_params = OrderedDict(model.named_parameters())
+        for name, param in model_params.items():
+            if name in ema_params:
+                ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
+def requires_grad(model, flag=True):
+    for p in model.parameters():
+        p.requires_grad = flag
+
+def create_logger(log_dir):
+    if dist.get_rank() == 0:
+        os.makedirs(log_dir, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[%(asctime)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(os.path.join(log_dir, "log.txt"))
+            ]
+        )
+        return logging.getLogger(__name__)
+    else:
+        logger = logging.getLogger(__name__)
+        logger.addHandler(logging.NullHandler())
+        return logger
+
+def train_layer_ddp(args, model, ema, dataset, transport, layer_name):
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
 
 
-total_layers = 25
-start_layer = 24
-end_layer = 24
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = rank % torch.cuda.device_count()
 
-#==== Model ====
-model = SiT(
-    hidden_size = 1152,
-    depth = 28,
-    num_heads = 16,
-    mlp_ratio = 4.0,
-    class_dropout_prob = 0.1,
-    num_classes = 100, #mini-imagenet
-    feature_layers = [f"layer{i}"for i in range(total_layers)],
-    feature_dims = {f"layer{i}": 768 for i in range(total_layers)}
-)
-device = torch.device("cuda")
-model.to(device)
+    print("[DEBUG] rank = ", rank)
+    print("[DEBUG] DDP initialized, start training...")
+    print("[DEBUG] Dataset length = ", len(dataset))
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    model.to(device)
+    ema.to(device)
+    #========================注意这里为了测试能不能跑通，我把多卡给关了================================================================================
+    # model = DDP(model, device_ids=[device])
+    #sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    sampler = None
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=0, drop_last=True)   #num_worker的数量
+    print("[DEBUG] DataLoader length =", len(dataloader))
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
-#==== progressive training loop ====
-for layer_id in range(start_layer, end_layer - 1, -1):
-    layer_name = f"layer{layer_id}"
-    print(f"\n--- Training target: {layer_name} ---")
+    layer_dir = os.path.join(args.results_dir, layer_name)
+    os.makedirs(layer_dir, exist_ok=True)
+    logger = create_logger(layer_dir)
 
-    dataset = ImageDinoFeatureDataset(root_dir = data_root, target_layer = layer_id, total_layers = total_layers, image_size=224)
-    loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
+    if rank == 0 and args.wandb:
+        wandb_utils.initialize(args, os.environ["ENTITY"], f"{layer_name}_run", os.environ["PROJECT"])
 
-    model.freeze_except_layer(layer_name)
+    logger.info(f"Start training {layer_name} for {args.epochs} epochs on rank {rank}")
+
+    update_ema(ema, model.module if hasattr(model, "module") else model)
     model.train()
+    ema.eval()
 
-    for epoch in range(1):
-        for batch in loader:
+    global_step = 0
+    for epoch in range(args.epochs):
+        if isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
+            sampler.set_epoch(epoch)
+        print(f"[Rank {rank}] Epoch {epoch} begin")
+        epoch_loss = 0
+        for step, batch in enumerate(dataloader):
+            print(f"[Rank {rank}] Step {step}, batch keys: {list(batch.keys())}")
             x_target = batch["x_target"].to(device)
             x_cond = batch["x_cond"].to(device)
+            t = batch["t"].to(device)
             y = batch["label"].to(device)
 
-            B = x_target.size(0)
-            t = torch.randint(1, 1000, (B,), device = device) * 0.999 + 0.001
-            noise = torch.randn_like(x_target)
-            x_t = plan.compute_xt(t, noise, x_target).detach()
+            model_kwargs = dict(y=y, layer_idx=layer_name)
+            batch_input = {
+                "x_cond": x_cond,
+                "x_target": x_target,
+                "t": t
+            }
 
-            x_hat = model.forward_multi_layer(x_t, x_cond, layer_name, t, y)
+            loss_dict = transport.training_losses(model, batch_input, model_kwargs)
+            loss = loss_dict["loss"].mean()
+            print(f"[Rank {rank}] Step {step}, batch keys: {list(batch.keys())}")
 
-            loss = F.mse_loss(x_hat, x_target)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print(f"x_target: {x_target.shape}, x_hat: {x_hat.shape}, loss: {loss.item():.4f}")
+            update_ema(ema, model)
 
-        
-        print(f"Eppoch {epoch}, Layer {layer_name}, Loss = {loss.item(): .4f}")
+            loss_val = loss.item()
+            epoch_loss += loss_val
+            global_step += 1
+
+            if global_step % args.log_every == 0:
+                avg_loss_tensor = torch.tensor(loss_val, device=device)
+                dist.all_reduce(avg_loss_tensor, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss_tensor.item() / world_size
+                logger.info(f"Step {global_step:06d} | Loss: {avg_loss:.4f}")
+                if rank == 0 and args.wandb:
+                    wandb_utils.log({"loss": avg_loss}, step=global_step)
+
+        if rank == 0:
+            model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            ema_state = ema.module.state_dict() if hasattr(ema, "module") else ema.state_dict()
+
+            ckpt = {
+                "model": model_state,
+                "ema": ema_state,
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch + 1
+            }
+
+            torch.save(ckpt, os.path.join(layer_dir, f"epoch_{epoch+1:03d}.pt"))
+            logger.info(f"Checkpoint saved at epoch {epoch+1}")
+
+    dist.barrier()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--h5-path", type=str, required=True)
+    parser.add_argument("--results-dir", type=str, default="checkpoints")
+    parser.add_argument("--model", type=str, default="SiT-L/2")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--global-seed", type=int, default=42)
+    parser.add_argument("--master-port", type=int, default=29500)
+
     
-    torch.save(model.state_dict(), f"{save_dir}/sit_layer{layer_id}.pt")
+
+    parse_transport_args(parser)
+    args = parser.parse_args()
+
+    init_method = f"tcp://127.0.0.1:{args.master_port}"
+    dist.init_process_group(backend="nccl", init_method=init_method, rank=0, world_size=1)
+
+    rank = dist.get_rank()
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    torch.manual_seed(args.global_seed * dist.get_world_size() + rank)
+
+    transport = create_transport(
+        path_type=args.path_type,
+        prediction=args.prediction,
+        loss_weight=args.loss_weight,
+        train_eps=args.train_eps,
+        sample_eps=args.sample_eps
+    )
+
+    model = SiT(
+        input_size=224,
+        patch_size=14,
+        in_channels=1024,
+        hidden_size=1024,
+        depth=24,
+        num_heads=16,
+        num_classes=1000
+    )
+    ema = deepcopy(model)
+
+    for layer in range(23, -1, -1):
+        model.freeze_except_layer(layer)
+        dataset = HDF5DinoFeatureDataset(args.h5_path, target_layer=layer)
+        train_layer_ddp(args, model, ema, dataset, transport, layer_name=f"layer_{layer}")
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

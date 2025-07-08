@@ -5,3 +5,8 @@ wandb
 samples
 results
 pretrained_models
+
+debug_results/
+features/
+*.h5
+__pycache__/

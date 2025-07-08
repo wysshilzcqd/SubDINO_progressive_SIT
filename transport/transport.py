@@ -112,7 +112,7 @@ class Transport:
         t = t.to(x1)
         return t, x0, x1
     
-
+    '''
     def training_losses(
         self, 
         model,  
@@ -156,6 +156,102 @@ class Transport:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
                 
         return terms
+    '''
+    
+    #q_sampler负责添加噪声
+    def q_sample(self, x_cond, t):
+        noise = th.randn_like(x_cond)
+
+        if isinstance(self.path_sampler, path.VPCPlan) or isinstance(self.path_sampler, path.GVPCPlan):
+            alpha_t = self.path_sampler.compute_alpha_t(t)[0]  # shape [B]
+            sigma_t = self.path_sampler.compute_sigma_t(t)[0]  # shape [B]
+            while len(alpha_t.shape) < len(x_cond.shape):
+                alpha_t = alpha_t.unsqueeze(-1)
+                sigma_t = sigma_t.unsqueeze(-1)
+            xt = alpha_t * x_cond + sigma_t * noise
+
+        elif isinstance(self.path_sampler, path.ICPlan):
+            # Linear interpolant: x_t = (1 - t) * x0 + t * x1
+            # For q_sample (adding noise to x1), we can mimic VP-like behavior with:
+            alpha_t = 1 - t
+            sigma_t = t
+            while len(alpha_t.shape) < len(x_cond.shape):
+                alpha_t = alpha_t.unsqueeze(-1)
+                sigma_t = sigma_t.unsqueeze(-1)
+            xt = alpha_t * x_cond + sigma_t * noise
+
+        else:
+            raise NotImplementedError(f"q_sample not defined for path type: {type(self.path_sampler)}")
+
+        return xt, noise
+
+    #新定义的training loss，因为要对x_cond加噪
+    def training_losses(self, model, batch, model_kwargs):
+        '''
+        Generalized training loss for progressive feature generation.
+        batch must contain:
+            - x_target: ground truth x0
+            - x_cond: conditional input x1 (e.g., layer_{i+1})
+            - t: timestep
+        '''
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        x0 = batch["x_target"]
+        x1 = batch["x_cond"]
+        t  = batch["t"]
+        y  = model_kwargs.get("y", None)
+
+        xt, noise = self.q_sample(x1, t)
+
+        model_output = model(xt, x0, t, **model_kwargs)
+        B, *_, C = xt.shape
+        assert model_output.shape == (B, *xt.shape[1:-1], C)
+
+        terms = {"pred": model_output}
+
+        if self.model_type == ModelType.VELOCITY:
+            alpha_t, _ = self.path_sampler.compute_alpha_t(t)
+            sigma_t, _ = self.path_sampler.compute_sigma_t(t)
+
+# 确保 alpha_t 和 sigma_t 广播到和 x0 一致
+            while len(alpha_t.shape) < len(x0.shape):
+                alpha_t = alpha_t.unsqueeze(-1)
+                sigma_t = sigma_t.unsqueeze(-1)
+
+            eps = xt - alpha_t * x0
+            v = -eps / sigma_t
+
+            velocity_target = v
+            weight = 1
+
+            if self.loss_type == WeightType.VELOCITY:
+                sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
+                weight = 1 / sigma_t**2
+            elif self.loss_type == WeightType.LIKELIHOOD:
+                # same weight as noise objective
+                sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
+                weight = 1 / sigma_t**2
+            elif self.loss_type == WeightType.NONE:
+                weight = 1
+            else:
+                raise NotImplementedError()
+
+            loss = weight * ((model_output - velocity_target) ** 2)
+
+        elif self.model_type == ModelType.NOISE:
+            noise_target = noise
+            loss = (model_output - noise_target) ** 2
+
+        elif self.model_type == ModelType.SCORE:
+            raise NotImplementedError("Score-based training not supported in progressive mode.")
+
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+
+        terms["loss"] = mean_flat(loss)
+        return terms
+
     
 
     def get_drift(

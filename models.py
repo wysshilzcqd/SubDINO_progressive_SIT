@@ -306,8 +306,6 @@ class SiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
-        feature_layers=["layer11","layer9"],
-        feature_dims={"layer11":768,"layer9":384} #这两行是用来选择progressive learning时的中间层特征图和对应维数，先这样写，后续customize
     ):
         super().__init__()
         self.input_size = input_size
@@ -320,21 +318,21 @@ class SiT(nn.Module):
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.cond_token_pooler = CondTokenPooler(hidden_size, num_heads)
         self.pos_embed = nn.Parameter(torch.zeros(1, (input_size // patch_size) ** 2 + 1, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
 
-        self.feature_layers = feature_layers
-        self.feature_dims = feature_dims
-        self.decoder_heads = nn.ModuleDict({
-            layer: nn.Sequential(
+      
+        self.decoder_heads =nn.ModuleDict({
+            f"layer_{i}": nn.Sequential(
                 nn.LayerNorm(hidden_size),
-                nn.Linear(hidden_size, dim)
-            )
-            for layer, dim in feature_dims.items() if layer in feature_layers
+                nn.Linear(hidden_size, hidden_size)
+            ) for i in range(depth)
         })
+        
 
         self.initialize_weights()
 
@@ -349,7 +347,7 @@ class SiT(nn.Module):
 
         grid_size = int(self.pos_embed.shape[1] ** 0.5)
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], grid_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, (self.input_size // self.patch_size) ** 2, self.hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, (self.input_size // self.patch_size) ** 2 + 1, self.hidden_size), requires_grad=False)
 
 
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
@@ -360,15 +358,16 @@ class SiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
     
-    def forward_multi_layer(self, x_t, cond_feature_map, layer_name,t, y):
+    def forward_multi_layer(self, x_t, layer_i_plus_1_noisy, t, y, layer_idx):
         B,H,W,D = x_t.shape
         x = x_t.reshape(B, -1, D)
+       
 
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y, self.training)
-        cond_token = self.cond_token_pooler(cond_feature_map)
+        cond_token = self.cond_token_pooler(layer_i_plus_1_noisy)
         cond = t_emb + y_emb + cond_token
-
+    
         x = torch.cat([cond.unsqueeze(1), x], 1)
         x += self.pos_embed[:, :x.shape[1], : ]
 
@@ -377,13 +376,20 @@ class SiT(nn.Module):
             x = block(x, cond)
         
         x = x[:, 1:, :].reshape(B,H,W,D)
-        x_hat = self.decoder_heads[layer_name](x)
+        decoder = self.decoder_heads[layer_idx]
+        x_hat = decoder(x)
         return x_hat
+    
+    #DDP仅支持识别forwrd函数
+    def forward(self, *args, **kwargs):
+        return self.forward_multi_layer(*args, **kwargs)
 
-    def freeze_except_layer(self, layer_name):
-        for name, module in self.decoder_heads.items():
-            for param in module.parameters():
-                param.requires_grad = (name == layer_name)
+    
+    def freeze_except_layer(self, layer_idx):
+        for name, decoder in self.decoder_heads.items():
+            requires_grad = (name == f"layer_{layer_idx}")
+            for param in decoder.parameters():
+                param.requires_grad = requires_grad
                 
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
